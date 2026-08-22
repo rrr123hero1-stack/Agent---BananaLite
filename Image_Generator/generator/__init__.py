@@ -1,3 +1,3 @@
-from .engine import FastONNXEngine
+from generator.engine import FastONNXEngine
 
 __all__ = ["FastONNXEngine"]
