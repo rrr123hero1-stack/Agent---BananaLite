@@ -3,14 +3,16 @@ import os
 import time
 from typing import Any
 from PIL import Image
-from optimum.onnxruntime import ORTStableDiffusionPipeline
+import torch
+from diffusers import AutoPipelineForText2Image, LCMScheduler
 
 from generator.enhancer import ImageQualityEnhancer
+from generator.fast_corrector import FastCPUCorrector
 from generator.text_weapon import LegalDocumentWeapon
 
 
 class FastONNXEngine:
-    """CPU ONNX Accelerated Engine for 15-step sharp generations (~40s)."""
+    """Adaptive CPU Generator supporting both human and general scene prompts."""
 
     def __init__(self) -> None:
         os.environ["HF_HOME"] = "/tmp/huggingface_cache"
@@ -18,6 +20,7 @@ class FastONNXEngine:
 
         self.text_weapon = LegalDocumentWeapon()
         self.enhancer = ImageQualityEnhancer()
+        self.corrector = FastCPUCorrector()
         self.pipe = None
         self.RATIOS: dict[str, tuple[int, int]] = {
             "1:1": (512, 512),
@@ -29,44 +32,59 @@ class FastONNXEngine:
         if self.pipe is not None:
             return
 
-        print("\n[ONNX Engine] Loading ONNX SD 1.5 Pipeline...")
-        model_id = "runwayml/stable-diffusion-v1-5"
+        print("\n[Engine] Loading CPU-Accelerated LCM SD 1.5 into /tmp...")
+        model_id = "SimianLuo/LCM_Dreamshaper_v7"
 
-        # Export and run via CPU ONNX Execution Provider
-        self.pipe = ORTStableDiffusionPipeline.from_pretrained(
+        torch.set_num_threads(os.cpu_count() or 8)
+
+        self.pipe = AutoPipelineForText2Image.from_pretrained(
             model_id,
-            export=True,
-            provider="CPUExecutionProvider",
+            torch_dtype=torch.float32,
+            safety_checker=None,
+            low_cpu_mem_usage=True,
         )
+
+        self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+        self.pipe.enable_attention_slicing()
 
     def generate(
         self,
         prompt: str,
-        steps: int = 15,
+        steps: int = 4,
         ratio: str = "1:1",
         long_text_overlay: str | None = None,
     ) -> Any:
         self._load_model()
 
         width, height = self.RATIOS.get(ratio, (512, 512))
-        print(f"\n[ONNX Engine] Rendering {width}x{height} | Steps: {steps}")
+        print(f"\n[Engine] Rendering {width}x{height} | Steps: {steps}")
 
         start_time = time.time()
 
-        enhanced_prompt = (
-            f"{prompt}, dressed in casual clothing, t-shirt, "
-            f"highly detailed face, sharp clear eyes, crisp focus, photorealistic"
-        )
-        negative_prompt = (
-            "nude, unclothed, bare chest, shirtless, blurred face, blurry features, "
-            "bad eyes, distorted face, extra limbs, bad anatomy, low quality"
-        )
+        person_keywords = [
+            "boy", "girl", "man", "woman", "person", 
+            "child", "human", "guy", "lady", "developer"
+        ]
+        is_person = any(k in prompt.lower() for k in person_keywords)
+
+        if is_person:
+            enhanced_prompt = (
+                f"{prompt}, wearing suitable attire according to situation, "
+                f"detailed facial features, clear eyes, crisp focus, photorealistic"
+            )
+            negative_prompt = (
+                "nude, unclothed, bare chest, shirtless, blurred face, blurry features, "
+                "bad eyes, distorted face, extra limbs, bad prompt adherence, bad anatomy, low quality"
+            )
+        else:
+            enhanced_prompt = f"{prompt}, high resolution, crisp details, photorealistic, 8k"
+            negative_prompt = "low quality, blurry, distorted, noisy, oversaturated, bad composition"
 
         output = self.pipe(
             prompt=enhanced_prompt,
             negative_prompt=negative_prompt,
             num_inference_steps=steps,
-            guidance_scale=7.5,
+            guidance_scale=8.6,
             width=width,
             height=height,
         )
@@ -77,8 +95,12 @@ class FastONNXEngine:
 
         img = self.enhancer.process(img, level=2)
 
+        # Run fast corrector
+        self.corrector.pipe = self.pipe
+        img = self.corrector.correct(img, prompt)
+
         elapsed = time.time() - start_time
-        print(f"[ONNX Engine] Generation finished in {elapsed:.2f}s")
+        print(f"[Engine] Total process finished in {elapsed:.2f}s")
 
         gc.collect()
         return img

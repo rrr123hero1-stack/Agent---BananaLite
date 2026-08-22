@@ -27,8 +27,9 @@ def main() -> None:
 
         output_image = engine.generate(
             prompt=prompt,
-            steps=15,
-            ratio="1:1",
+            steps=6,
+            ratio="4:4",
+
         )
 
         gen_count += 1
