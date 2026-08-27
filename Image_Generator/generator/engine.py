@@ -1,110 +1,68 @@
-import gc
 import os
-import re
-import time
-from typing import Any
-from PIL import Image
 import torch
-
-try:
-    import cv2
-    import numpy as np
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-
-from diffusers import AutoPipelineForText2Image
-from generator.enhancer import ImageQualityEnhancer
-from generator.text_weapon import LegalDocumentWeapon
-
+from diffusers import DiffusionPipeline, DDIMScheduler
+from compel import Compel
 
 class FastONNXEngine:
-    """SDXL-Turbo CPU Engine: Native HD Resolution & Low Memory Footprint."""
-
-    def __init__(self) -> None:
+    def __init__(self):
         os.environ["HF_HOME"] = "/tmp/huggingface_cache"
         os.environ["TRANSFORMERS_CACHE"] = "/tmp/huggingface_cache"
-
-        self.text_weapon = LegalDocumentWeapon()
-        self.enhancer = ImageQualityEnhancer()
-        self.pipe = None
         
-        # Native HD Ratios tuned for SDXL
-        self.RATIOS: dict[str, tuple[int, int]] = {
-            "16:9": (1024, 576),
-            "1:1": (768, 768),
-            "9:16": (576, 1024),
-            "4:3": (896, 672),
+        self.model_id = "Lykon/dreamshaper-8"
+        self.lora_repo = "ByteDance/Hyper-SD"
+        self.lora_name = "Hyper-SD15-1step-lora.safetensors"
+        
+        self.pipe = None
+        self.compel = None
+        
+        self.ratio_map = {
+            "1:1": (512, 512),
+            "16:9": (768, 448),
+            "9:16": (448, 768)
         }
 
-    def _load_model(self) -> None:
+    def _load_model(self):
         if self.pipe is not None:
             return
 
-        print("\n[Engine] Downloading and loading SDXL-Turbo (Native HD)...")
-        model_id = "stabilityai/sdxl-turbo"
-
-        torch.set_num_threads(os.cpu_count() or 8)
-
-        self.pipe = AutoPipelineForText2Image.from_pretrained(
-            model_id,
-            dtype=torch.float32,
-            safety_checker=None,
+        print("\n⏳ [Engine] Initializing model into RAM...")
+        
+        self.pipe = DiffusionPipeline.from_pretrained(
+            self.model_id,
+            torch_dtype=torch.float32,
             low_cpu_mem_usage=True,
+            safety_checker=None
         )
-
-        # RAM Optimization (Keeps peak memory under ~4.8 GB)
+        
+        # Load weights without heavy fusing
+        self.pipe.load_lora_weights(self.lora_repo, weight_name=self.lora_name)
+        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config, timestep_spacing="trailing")
+        
         self.pipe.enable_attention_slicing()
-        self.pipe.enable_vae_slicing()
+        self.pipe.unet.to(memory_format=torch.channels_last)
+        
+        self.compel = Compel(tokenizer=self.pipe.tokenizer, text_encoder=self.pipe.text_encoder)
+        print("🚀 [Engine] Model ready!\n")
 
-    def _build_max_detail_prompt(self, prompt: str) -> str:
-        return (
-            f"{prompt}, ultra-detailed 8k resolution, razor sharp focus, natural skin pores, "
-            f"photorealistic lighting, clear legible typography, masterwork"
-        )
-
-    def _sharpen_image(self, pil_img: Image.Image) -> Image.Image:
-        if not HAS_CV2:
-            return pil_img
-        img_np = np.array(pil_img)
-        gaussian_blur = cv2.GaussianBlur(img_np, (0, 0), 1.5)
-        sharpened = cv2.addWeighted(img_np, 1.3, gaussian_blur, -0.3, 0)
-        return Image.fromarray(sharpened)
-
-    def generate(
-        self,
-        prompt: str,
-        steps: int = 2,  # SDXL-Turbo peaks at 1-2 steps
-        ratio: str = "16:9",
-        long_text_overlay: str | None = None,
-    ) -> Any:
+    def generate(self, prompt: str, ratio: str = "16:9", steps: int = 3, output_path: str = "output.png"):
         self._load_model()
-
-        enhanced_prompt = self._build_max_detail_prompt(prompt)
-        width, height = self.RATIOS.get(ratio, (1024, 576))
-
-        print(f"\n[Engine] Rendering {width}x{height} | Steps: {steps}")
-        start_time = time.time()
-
-        # Guidance scale set to 1.0 for optimal SDXL-Turbo output
-        output = self.pipe(
-            prompt=enhanced_prompt,
+        
+        width, height = self.ratio_map.get(ratio, (768, 448))
+        print(f"🎨 [Engine] Rendering layout {ratio} ({width}x{height}) | Steps: {steps}")
+        print(f"📝 Prompt: {prompt}")
+        
+        conditioning = self.compel(prompt)
+        g_scale = 0.0 if steps == 1 else 1.0
+        
+        image = self.pipe(
+            prompt_embeds=conditioning,
             num_inference_steps=steps,
-            guidance_scale=1.0,
+            guidance_scale=g_scale,
+            cross_attention_kwargs={"scale": 1.0}, # Applies LoRA dynamically safely
             width=width,
-            height=height,
-        )
-        img = output.images[0]
-
-        img = self._sharpen_image(img)
-
-        if long_text_overlay and len(long_text_overlay) > 2:
-            img = self.text_weapon.apply_overlay(img, long_text_overlay)
-
-        img = self.enhancer.process(img, level=2)
-
-        elapsed = time.time() - start_time
-        print(f"[Engine] Generation completed in {elapsed:.2f}s")
-
-        gc.collect()
-        return img
+            height=height
+        ).images[0]
+        
+        image.save(output_path)
+        print(f"✅ [Engine] Saved artifact to: {output_path}\n")
+        return output_path
